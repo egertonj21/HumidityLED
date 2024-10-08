@@ -6,12 +6,14 @@
 #define DHTTYPE DHT22    // DHT 22 (AM2302)
 
 // Wi-Fi credentials
-const char* ssid = "YOUR_SSID";              // Replace with your Wi-Fi SSID
-const char* password = "YOUR_PASSWORD";       // Replace with your Wi-Fi password
+const char* ssid = "wifiSSD";              // Replace with your Wi-Fi SSID
+const char* password = "WifiPass";       // Replace with your Wi-Fi password
 
 // MQTT broker details
-const char* mqtt_server = "YOUR_MQTT_BROKER_IP";  // Replace with your MQTT broker IP
+const char* mqtt_server = "MQTTIP";  // Replace with your MQTT broker IP
 const char* publish_topic = "sensor/data";   // Topic to publish temperature and humidity data
+const char* ack_topic = "sensor/ack";        // Topic to receive acknowledgment for the published data
+const char* request_topic = "sensor/request"; // Topic to subscribe to for sensor data requests
 
 // Initialize DHT sensor
 DHT dht(DHTPIN, DHTTYPE);
@@ -28,6 +30,17 @@ PubSubClient client(espClient);
 unsigned long lastPublishTime = 0;  // Time for last publish
 const unsigned long publishInterval = 3600000;  // 1 hour in milliseconds
 const unsigned long printInterval = 10000;        // 10 seconds in milliseconds
+const unsigned long ackTimeout = 5000;            // Timeout waiting for ack (5 seconds)
+
+// State variables
+bool ledControlEnabled = true;  // Flag to control whether LED logic is active
+bool ackReceived = false;       // Flag to track if ACK was received
+
+// Sensor data to resend
+char lastPayload[64];
+
+// Timing for ACK
+unsigned long lastSendTime = 0;
 
 void setup() {
     Serial.begin(115200);
@@ -44,8 +57,12 @@ void setup() {
     }
     Serial.println("Connected to WiFi");
 
-    // Set MQTT server
+    // Set MQTT server and callback function
     client.setServer(mqtt_server, 1883);
+    client.setCallback(callback);
+
+    // Ensure MQTT connection
+    reconnect();
 }
 
 void loop() {
@@ -77,28 +94,79 @@ void loop() {
         lastPrintTime = millis();
     }
 
-    // Control LEDs based on humidity
-    if (h < 50) {
-        // Low humidity - Turn on green LED
-        digitalWrite(GREEN_LED_PIN, HIGH);
-        digitalWrite(RED_LED_PIN, LOW);
-    } else if (h >= 50 && h <= 60) {
-        // Moderate humidity - Turn on both red and green for orange
-        digitalWrite(GREEN_LED_PIN, HIGH);
-        digitalWrite(RED_LED_PIN, HIGH);
+    // Control LEDs based on humidity if LED control is enabled
+    if (ledControlEnabled) {
+        if (h < 50) {
+            // Low humidity - Turn on green LED
+            digitalWrite(GREEN_LED_PIN, HIGH);
+            digitalWrite(RED_LED_PIN, LOW);
+        } else if (h >= 50 && h <= 60) {
+            // Moderate humidity - Turn on both red and green for orange
+            digitalWrite(GREEN_LED_PIN, HIGH);
+            digitalWrite(RED_LED_PIN, HIGH);
+        } else {
+            // High humidity - Turn on red LED
+            digitalWrite(RED_LED_PIN, HIGH);
+            digitalWrite(GREEN_LED_PIN, LOW);
+        }
     } else {
-        // High humidity - Turn on red LED
-        digitalWrite(RED_LED_PIN, HIGH);
+        // LED control is disabled, so turn off both LEDs
+        digitalWrite(RED_LED_PIN, LOW);
         digitalWrite(GREEN_LED_PIN, LOW);
     }
 
-    // Publish temperature and humidity to MQTT topic every hour
-    if (millis() - lastPublishTime >= publishInterval) {
-        char payload[64];
-        sprintf(payload, "Temp: %.2f, Humidity: %.2f", t, h);
-        client.publish(publish_topic, payload);
-        Serial.println("Published: " + String(payload));
-        lastPublishTime = millis();
+    // Publish temperature and humidity to MQTT topic every hour or if ACK is not received
+    if (millis() - lastPublishTime >= publishInterval || !ackReceived) {
+        if (millis() - lastSendTime > ackTimeout && !ackReceived) {
+            sprintf(lastPayload, "Temp: %.2f, Humidity: %.2f", t, h);
+            client.publish(publish_topic, lastPayload);
+            Serial.println("Published: " + String(lastPayload));
+            lastSendTime = millis();
+            ackReceived = false; // Expect ACK
+        }
+    }
+}
+
+// MQTT callback function to handle messages
+void callback(char* topic, byte* payload, unsigned int length) {
+    String message;
+    for (unsigned int i = 0; i < length; i++) {
+        message += (char)payload[i];
+    }
+    Serial.print("Message arrived on topic: ");
+    Serial.println(topic);
+    Serial.print("Message: ");
+    Serial.println(message);
+
+    // Handle ACK for sensor data
+    if (String(topic) == ack_topic) {
+        if (message == "ACK") {
+            ackReceived = true;  // Acknowledgment received, stop resending
+            Serial.println("ACK received, stopping resend");
+        }
+    }
+
+    // Handle requests for sensor data
+    if (String(topic) == request_topic) {
+        if (message == "GET_DATA") {
+            float h = dht.readHumidity();
+            float t = dht.readTemperature();
+            char response[64];
+            sprintf(response, "Temp: %.2f, Humidity: %.2f", t, h);
+            client.publish("sensor/response", response);
+            Serial.println("Responded with sensor data: " + String(response));
+        }
+    }
+
+    // Handle LED control (turn on/off LED logic)
+    if (String(topic) == "led/control") {
+        if (message == "LED_CONTROL_ON") {
+            ledControlEnabled = true;
+            Serial.println("LED control enabled");
+        } else if (message == "LED_CONTROL_OFF") {
+            ledControlEnabled = false;
+            Serial.println("LED control disabled");
+        }
     }
 }
 
@@ -109,6 +177,11 @@ void reconnect() {
         // Attempt to connect
         if (client.connect("ESP32Client")) {
             Serial.println("connected");
+            // Subscribe to the LED control, ack, and request topics
+            client.subscribe("led/control");
+            client.subscribe(ack_topic);
+            client.subscribe(request_topic);
+            Serial.println("Subscribed to necessary topics");
         } else {
             Serial.print("failed, rc=");
             Serial.print(client.state());
